@@ -1,0 +1,25 @@
+*data*/
+*download*/
+*video*/
+__pycache__/
+assets/
+logs/
+results/
+checkpoint*/
+*.egg-info/
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+# Ignore virtual environment directories
+venv/
+env/
+# Ignore Python bytecode files
+*.pyc
+# Ignore distribution files
+dist/
+build/
+*.egg/
+# Ignore coverage reports
+.coverage
+htmlcov/
+# Ignore pytest cache
+.pytest_cache/
