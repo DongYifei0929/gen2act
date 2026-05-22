@@ -5,7 +5,7 @@ The policy consumes:
 - a robot observation history [B, 8, 3, 224, 224]
 
 and predicts:
-- discretized end-effector actions
+- a 6D end-effector pose action vector, discretized per dimension
 - terminate logits
 - gripper logits
 
@@ -19,7 +19,6 @@ import torch.nn as nn
 
 from gen2act.modeling.resampler import PerceiverResampler
 from gen2act.modeling.track import TrackPredictor
-from gen2act.modeling.transformer import SequenceTransformerEncoder
 from gen2act.modeling.vit import ViTBackbone
 
 
@@ -47,6 +46,44 @@ class ActionHead(nn.Module):
         terminate_logits = self.terminate_proj(hidden)
         gripper_logits = self.gripper_proj(hidden)
         return action_logits, terminate_logits, gripper_logits
+
+
+class CrossAttentionFusion(nn.Module):
+    """Cross-attend robot history queries to human video keys and values."""
+
+    def __init__(self, dim: int, heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.query_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ff = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, 4 * dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * dim, dim),
+        )
+
+    def forward(self, query_tokens: torch.Tensor, context_tokens: torch.Tensor) -> torch.Tensor:
+        if query_tokens.dim() != 3:
+            raise ValueError(f"Expected query tokens as [B, N, D], got {tuple(query_tokens.shape)}")
+        if context_tokens.dim() != 3:
+            raise ValueError(f"Expected context tokens as [B, N, D], got {tuple(context_tokens.shape)}")
+
+        attended, _ = self.cross_attn(
+            query=self.query_norm(query_tokens),
+            key=self.context_norm(context_tokens),
+            value=context_tokens,
+            need_weights=False,
+        )
+        fused = query_tokens + attended
+        fused = fused + self.ff(fused)
+        return fused
 
 
 class Gen2ActPolicy(nn.Module):
@@ -100,9 +137,8 @@ class Gen2ActPolicy(nn.Module):
         human_tokens = self.encode_video(human_video, self.human_resampler)   # [B, Kh, D]
         robot_tokens = self.encode_video(robot_history, self.robot_resampler)  # [B, Kr, D]
 
-        tokens = torch.cat([human_tokens, robot_tokens], dim=1)  # [B, Kh+Kr, D]
-        tokens = self.fusion(tokens)
-        ctx = tokens.mean(dim=1)  # [B, D]
+        robot_tokens = self.fusion(robot_tokens, human_tokens)  # [B, Kr, D]
+        ctx = robot_tokens.mean(dim=1)  # [B, D]
 
         action_logits, terminate_logits, gripper_logits = self.action_head(ctx)
         out = {
@@ -119,7 +155,7 @@ class Gen2ActPolicy(nn.Module):
 
 
 def build_default_policy(
-    num_action_dims: int = 7,
+    num_action_dims: int = 6,
     num_bins: int = 256,
     image_size: int = 224,
     patch_size: int = 16,
@@ -143,7 +179,7 @@ def build_default_policy(
     )
     human_resampler = PerceiverResampler(dim=hidden_dim, num_latents=latent_tokens, num_layers=2, num_heads=8)
     robot_resampler = PerceiverResampler(dim=hidden_dim, num_latents=latent_tokens, num_layers=2, num_heads=8)
-    fusion = SequenceTransformerEncoder(dim=hidden_dim, depth=4, heads=8)
+    fusion = CrossAttentionFusion(dim=hidden_dim, heads=8)
     action_head = ActionHead(dim=hidden_dim, num_action_dims=num_action_dims, num_bins=num_bins)
     track_predictor = TrackPredictor(dim=hidden_dim, depth=6, heads=8, track_dim=2, max_steps=64)
 

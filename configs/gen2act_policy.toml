@@ -1,0 +1,38 @@
+[model]
+num_action_dims = 6
+num_bins = 256
+image_size = 224
+patch_size = 16
+hidden_dim = 768
+num_vit_layers = 12
+num_vit_heads = 12
+latent_tokens = 16
+
+[data]
+dataset_path = "demo_data/pick_n_place_258.hdf5"
+human_camera = "table_cam"
+robot_camera = "wrist_cam"
+human_video_len = 16
+robot_history_len = 8
+image_size = 224
+action_stride = 1
+max_samples = 0
+gripper_threshold = 0.5
+
+[train]
+batch_size = 2
+epochs = 5
+lr = 0.0003
+weight_decay = 0.0001
+seed = 42
+val_split = 0.05
+num_workers = 0
+log_every = 10
+save_every = 1
+output_dir = "outputs/gen2act_policy"
+
+[infer]
+checkpoint_path = "outputs/gen2act_policy/latest.pt"
+demo_index = 0
+start_index = 0
+save_path = "outputs/gen2act_policy/infer_sample.npz"

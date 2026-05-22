@@ -25,6 +25,9 @@ References:
 architecture.py
 gen2act/
   __init__.py
+  data/
+    __init__.py
+    hdf5_policy_dataset.py
   modeling/
     __init__.py
     vit.py
@@ -32,6 +35,11 @@ gen2act/
     transformer.py
     track.py
     policy.py
+configs/
+  gen2act_policy.toml
+scripts/
+  train_policy.py
+  infer_policy.py
 ```
 
 ## Module Responsibilities
@@ -63,6 +71,17 @@ gen2act/
 - `architecture.py`
   - Compatibility wrapper that re-exports the main classes for older imports
 
+## Runtime Entry Points
+
+- `configs/gen2act_policy.toml`
+  - Central model, data, train, and inference defaults
+- `scripts/train_policy.py`
+  - HDF5-based behavior cloning training loop for the Gen2Act policy
+- `scripts/infer_policy.py`
+  - Loads a checkpoint and runs one-step policy inference on a demo window
+- `gen2act/data/hdf5_policy_dataset.py`
+  - Dataset adapter that turns Isaac Lab HDF5 demos into policy training windows
+
 ## Data Flow
 
 1. A generated human video is encoded frame-by-frame by the ViT backbone.
@@ -77,7 +96,7 @@ gen2act/
 
 ## Tensor Shapes
 
-- Human video input: `[B, 24, 3, 224, 224]`
+- Human video input: `[B, 16/24, 3, 224, 224]`
 - Robot history input: `[B, 8, 3, 224, 224]`
 - ViT output per frame: `[B*T, P, D]`
 - Resampler output: `[B, K, D]`
