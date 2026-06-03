@@ -1,9 +1,10 @@
-*data*/
-*download*/
+data*/
+download*/
 *video*/
 __pycache__/
 assets/
 logs/
+outputs/
 results/
 checkpoint*/
 *.egg-info/

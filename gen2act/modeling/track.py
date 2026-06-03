@@ -43,29 +43,57 @@ class CoTrackerPointTracker(nn.Module):
 
     def __init__(
         self,
-        checkpoint: str = "./checkpoints/scaled_offline.pth",
+        checkpoint: Optional[str] = None,
         offline: bool = True,
         v2: bool = False,
         window_len: int = 60,
+        use_hub: bool = False,
     ) -> None:
         super().__init__()
         _ensure_cotracker_path()
 
-        try:
-            from cotracker.predictor import CoTrackerPredictor, CoTrackerOnlinePredictor
-        except Exception as exc:  # pragma: no cover - import-time environment issue
-            raise ImportError(
-                "Could not import the bundled co-tracker package. "
-                "Make sure the repository checkout includes the `co-tracker/` directory."
-            ) from exc
+        self.offline = offline
 
-        predictor_cls = CoTrackerPredictor if offline else CoTrackerOnlinePredictor
-        self.predictor = predictor_cls(
-            checkpoint=checkpoint,
-            offline=offline,
-            v2=v2,
-            window_len=window_len,
-        )
+        repo_root = Path(__file__).resolve().parents[2]
+        cotracker_root = repo_root / "co-tracker"
+        if use_hub:
+            if not cotracker_root.is_dir():
+                raise FileNotFoundError(
+                    "Cannot locate bundled co-tracker repository for torch.hub loading."
+                )
+            hub_name = "cotracker3_offline" if offline else "cotracker3_online"
+            self.predictor = torch.hub.load(
+                str(cotracker_root), hub_name, source="local"
+            )
+        else:
+            if checkpoint is None:
+                raise ValueError(
+                    "checkpoint is required unless use_hub=True; "
+                    "set track.checkpoint or enable track.use_hub in the config."
+                )
+            try:
+                from cotracker.predictor import CoTrackerPredictor, CoTrackerOnlinePredictor
+            except Exception as exc:  # pragma: no cover - import-time environment issue
+                raise ImportError(
+                    "Could not import the bundled co-tracker package. "
+                    "Make sure the repository checkout includes the `co-tracker/` directory."
+                ) from exc
+
+            predictor_cls = CoTrackerPredictor if offline else CoTrackerOnlinePredictor
+            self.predictor = predictor_cls(
+                checkpoint=checkpoint,
+                offline=offline,
+                v2=v2,
+                window_len=window_len,
+            )
+
+    @staticmethod
+    def _prepare_video(video: torch.Tensor) -> torch.Tensor:
+        if not torch.is_floating_point(video):
+            video = video.float()
+        if video.numel() > 0 and float(video.max().item()) <= 1.5:
+            video = video * 255.0
+        return video
 
     @torch.no_grad()
     def forward(
@@ -92,6 +120,9 @@ class CoTrackerPointTracker(nn.Module):
             visibility: [B, T, N]
         """
 
+        video = self._prepare_video(video)
+        if not self.offline:
+            raise RuntimeError("CoTrackerPointTracker currently supports offline mode only.")
         return self.predictor(
             video=video,
             queries=queries,
@@ -100,6 +131,38 @@ class CoTrackerPointTracker(nn.Module):
             grid_query_frame=grid_query_frame,
             backward_tracking=backward_tracking,
         )
+
+    @torch.no_grad()
+    def track(
+        self,
+        video: torch.Tensor,
+        queries: Optional[torch.Tensor] = None,
+        segm_mask: Optional[torch.Tensor] = None,
+        grid_size: int = 0,
+        grid_query_frame: int = 0,
+        backward_tracking: bool = False,
+        output_format: str = "bnt",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Track points and return tracks in a chosen layout.
+
+        output_format:
+            - "btn": tracks [B, T, N, 2], visibility [B, T, N]
+            - "bnt": tracks [B, N, T, 2], visibility [B, N, T]
+        """
+
+        tracks, visibility = self.forward(
+            video=video,
+            queries=queries,
+            segm_mask=segm_mask,
+            grid_size=grid_size,
+            grid_query_frame=grid_query_frame,
+            backward_tracking=backward_tracking,
+        )
+        if output_format == "btn":
+            return tracks, visibility
+        if output_format == "bnt":
+            return tracks.permute(0, 2, 1, 3).contiguous(), visibility.permute(0, 2, 1).contiguous()
+        raise ValueError(f"Unknown output_format={output_format}")
 
 
 class TrackPredictor(nn.Module):

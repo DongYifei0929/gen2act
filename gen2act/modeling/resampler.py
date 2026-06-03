@@ -43,14 +43,15 @@ class PerceiverResampler(nn.Module):
             [
                 nn.ModuleDict(
                     {
+                        "sa_norm": nn.LayerNorm(dim),
                         "self_attn": nn.MultiheadAttention(
                             embed_dim=dim,
                             num_heads=num_heads,
                             dropout=dropout,
                             batch_first=True,
                         ),
+                        "ff_norm": nn.LayerNorm(dim),
                         "ff": nn.Sequential(
-                            nn.LayerNorm(dim),
                             nn.Linear(dim, ff_mult * dim),
                             nn.GELU(),
                             nn.Dropout(dropout),
@@ -80,8 +81,9 @@ class PerceiverResampler(nn.Module):
         )
 
         for block in self.blocks:
-            attn_out, _ = block["self_attn"](latents, latents, latents, need_weights=False)
+            normed = block["sa_norm"](latents)
+            attn_out, _ = block["self_attn"](normed, normed, normed, need_weights=False)
             latents = latents + attn_out
-            latents = latents + block["ff"](latents)
+            latents = latents + block["ff"](block["ff_norm"](latents))
 
         return latents

@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from gen2act.modeling.resampler import PerceiverResampler
-from gen2act.modeling.track import TrackPredictor
+from gen2act.modeling.track import CoTrackerPointTracker, TrackPredictor
 from gen2act.modeling.vit import ViTBackbone
 
 
@@ -99,6 +99,12 @@ class Gen2ActPolicy(nn.Module):
         track_predictor: nn.Module,
         num_action_dims: int,
         num_bins: int = 256,
+        image_size: int = 224,
+        point_tracker: nn.Module | None = None,
+        enable_point_tracking: bool = False,
+        track_grid_size: int = 10,
+        track_query_frame: int = 0,
+        track_backward: bool = False,
     ) -> None:
         super().__init__()
         self.vit = vit_encoder
@@ -109,6 +115,12 @@ class Gen2ActPolicy(nn.Module):
         self.track_predictor = track_predictor
         self.num_action_dims = num_action_dims
         self.num_bins = num_bins
+        self.image_size = image_size
+        self.point_tracker = point_tracker
+        self.enable_point_tracking = enable_point_tracking
+        self.track_grid_size = track_grid_size
+        self.track_query_frame = track_query_frame
+        self.track_backward = track_backward
 
     def encode_video(self, frames: torch.Tensor, resampler: nn.Module) -> torch.Tensor:
         if frames.dim() != 5:
@@ -131,25 +143,83 @@ class Gen2ActPolicy(nn.Module):
         gt_actions=None,
         gt_terminate=None,
         gt_gripper=None,
+        debug_isfinite: bool = False,
     ):
         del scene_img, task_prompt_tokens, gt_actions, gt_terminate, gt_gripper
+
+        def _check_finite(name: str, tensor: torch.Tensor) -> None:
+            if not torch.isfinite(tensor).all():
+                bad = (~torch.isfinite(tensor)).nonzero(as_tuple=False)
+                first_bad = bad[0].tolist() if bad.numel() > 0 else None
+                print(f"[nan] {name} non-finite shape={tuple(tensor.shape)} first_bad={first_bad}")
 
         human_tokens = self.encode_video(human_video, self.human_resampler)   # [B, Kh, D]
         robot_tokens = self.encode_video(robot_history, self.robot_resampler)  # [B, Kr, D]
 
+        if debug_isfinite:
+            _check_finite("human_tokens", human_tokens)
+            _check_finite("robot_tokens", robot_tokens)
+
         robot_tokens = self.fusion(robot_tokens, human_tokens)  # [B, Kr, D]
         ctx = robot_tokens.mean(dim=1)  # [B, D]
 
+        if debug_isfinite:
+            _check_finite("fusion_tokens", robot_tokens)
+            _check_finite("ctx", ctx)
+
         action_logits, terminate_logits, gripper_logits = self.action_head(ctx)
+
+        if debug_isfinite:
+            _check_finite("action_logits", action_logits)
+            _check_finite("terminate_logits", terminate_logits)
+            _check_finite("gripper_logits", gripper_logits)
         out = {
             "action_logits": action_logits,
             "terminate_logits": terminate_logits,
             "gripper_logits": gripper_logits,
         }
 
-        if self.training and gt_human_tracks is not None and gt_robot_tracks is not None:
-            out["human_track_pred"] = self.track_predictor(human_tokens, gt_human_tracks)
-            out["robot_track_pred"] = self.track_predictor(robot_tokens, gt_robot_tracks)
+        human_tracks_for_loss = gt_human_tracks
+        robot_tracks_for_loss = gt_robot_tracks
+        human_track_vis = None
+        robot_track_vis = None
+
+        if (
+            self.training
+            and self.enable_point_tracking
+            and self.point_tracker is not None
+            and (human_tracks_for_loss is None or robot_tracks_for_loss is None)
+        ):
+            if human_tracks_for_loss is None:
+                human_tracks_for_loss, human_track_vis = self.point_tracker.track(
+                    human_video,
+                    grid_size=self.track_grid_size,
+                    grid_query_frame=self.track_query_frame,
+                    backward_tracking=self.track_backward,
+                    output_format="bnt",
+                )
+                human_tracks_for_loss = human_tracks_for_loss / float(self.image_size)
+                out["human_tracks"] = human_tracks_for_loss
+                out["human_track_vis"] = human_track_vis
+            if robot_tracks_for_loss is None:
+                robot_tracks_for_loss, robot_track_vis = self.point_tracker.track(
+                    robot_history,
+                    grid_size=self.track_grid_size,
+                    grid_query_frame=self.track_query_frame,
+                    backward_tracking=self.track_backward,
+                    output_format="bnt",
+                )
+                robot_tracks_for_loss = robot_tracks_for_loss / float(self.image_size)
+                out["robot_tracks"] = robot_tracks_for_loss
+                out["robot_track_vis"] = robot_track_vis
+
+        if self.training and human_tracks_for_loss is not None and robot_tracks_for_loss is not None:
+            out["human_track_pred"] = self.track_predictor(human_tokens, human_tracks_for_loss)
+            out["robot_track_pred"] = self.track_predictor(robot_tokens, robot_tracks_for_loss)
+            if gt_human_tracks is not None:
+                out["human_tracks"] = gt_human_tracks / float(self.image_size)
+            if gt_robot_tracks is not None:
+                out["robot_tracks"] = gt_robot_tracks / float(self.image_size)
 
         return out
 
@@ -163,6 +233,16 @@ def build_default_policy(
     num_vit_layers: int = 12,
     num_vit_heads: int = 12,
     latent_tokens: int = 16,
+    vit_pretrained: str | None = None,
+    enable_point_tracking: bool = False,
+    point_tracker_checkpoint: str | None = None,
+    point_tracker_use_hub: bool = False,
+    point_tracker_offline: bool = True,
+    point_tracker_v2: bool = False,
+    point_tracker_window_len: int = 60,
+    track_grid_size: int = 10,
+    track_query_frame: int = 0,
+    track_backward: bool = False,
 ) -> Gen2ActPolicy:
     """Build the default Gen2Act model stack.
 
@@ -176,12 +256,22 @@ def build_default_policy(
         hidden_dim=hidden_dim,
         num_layers=num_vit_layers,
         num_heads=num_vit_heads,
+        pretrained=vit_pretrained,
     )
     human_resampler = PerceiverResampler(dim=hidden_dim, num_latents=latent_tokens, num_layers=2, num_heads=8)
     robot_resampler = PerceiverResampler(dim=hidden_dim, num_latents=latent_tokens, num_layers=2, num_heads=8)
     fusion = CrossAttentionFusion(dim=hidden_dim, heads=8)
     action_head = ActionHead(dim=hidden_dim, num_action_dims=num_action_dims, num_bins=num_bins)
     track_predictor = TrackPredictor(dim=hidden_dim, depth=6, heads=8, track_dim=2, max_steps=64)
+    point_tracker = None
+    if enable_point_tracking:
+        point_tracker = CoTrackerPointTracker(
+            checkpoint=point_tracker_checkpoint,
+            offline=point_tracker_offline,
+            v2=point_tracker_v2,
+            window_len=point_tracker_window_len,
+            use_hub=point_tracker_use_hub,
+        )
 
     return Gen2ActPolicy(
         vit_encoder=vit,
@@ -192,4 +282,10 @@ def build_default_policy(
         track_predictor=track_predictor,
         num_action_dims=num_action_dims,
         num_bins=num_bins,
+        image_size=image_size,
+        point_tracker=point_tracker,
+        enable_point_tracking=enable_point_tracking,
+        track_grid_size=track_grid_size,
+        track_query_frame=track_query_frame,
+        track_backward=track_backward,
     )

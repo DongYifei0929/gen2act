@@ -1,0 +1,71 @@
+[model]
+num_action_dims = 7
+num_bins = 256
+image_size = 224
+patch_size = 14
+hidden_dim = 768
+num_vit_layers = 12
+num_vit_heads = 12
+latent_tokens = 16
+pretrained = "dinov2"
+
+[data]
+dataset_type = "toto_gen"
+dataset_path = "dataset/toto_gen"
+human_video_len = 16
+robot_history_len = 8
+image_size = 224
+action_stride = 1
+max_samples = 0
+max_episodes = 10
+gripper_threshold = 0.5
+terminate_threshold = 0.5
+
+# Optional overrides for Toto-Gen layout
+# toto_generated_subdir = "toto-gen"
+# toto_robot_subdir = "toto"
+# toto_generated_video_name = "generated.mp4"
+# toto_robot_video_name = "image.mp4"
+# toto_metadata_name = "data.json"
+
+[train]
+batch_size = 1
+epochs = 5
+lr = 0.001
+weight_decay = 0.0001
+seed = 42
+val_split = 0.05
+num_workers = 0
+log_every = 10
+save_every = 1
+output_dir = "outputs/gen2act_policy_toto_gen"
+debug_isfinite = true
+debug_norms = true
+debug_norm_every = 10  
+gradnorm = true
+gradnorm_alpha = 1.5
+gradnorm_lr = 1.0e-3
+
+[track]
+enable = true
+offline = true
+use_hub = true
+checkpoint = ""
+grid_size = 10
+grid_query_frame = 0
+backward_tracking = false
+window_len = 60
+use_v2_model = false
+
+[wandb]
+enabled = false
+project = "gen2act"
+# entity = "your_wandb_entity"
+# run_name = "toto_gen_run"
+# tags = ["toto_gen"]
+
+[infer]
+checkpoint_path = "outputs/gen2act_policy_toto_gen/latest.pt"
+demo_index = 0
+start_index = 0
+save_path = "outputs/gen2act_policy_toto_gen/infer_sample.npz"

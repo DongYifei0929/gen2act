@@ -1,13 +1,14 @@
 """Vision Transformer backbone used for per-frame image encoding.
 
-The backbone now wraps a real torchvision ViT first, with a timm fallback for
-environments where torchvision is unavailable or a non-default configuration is
-requested. The public API stays the same as the prior local implementation:
-it returns patch tokens shaped ``[B, P, D]`` rather than classifier logits.
+Supports:
+- torchvision ViT-B/16 (random init or ImageNet pretrained)
+- DINOv2 ViT-B/14 via torchvision (pretrained)
+- timm fallback for custom configurations
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional
 
 import torch
@@ -19,13 +20,23 @@ except Exception:  # pragma: no cover - import-time fallback only
     vit_b_16 = None
 
 try:
+    from torchvision.models import dinov2_vitb14 as _tv_dinov2_vitb14
+except Exception:  # pragma: no cover - import-time fallback only
+    _tv_dinov2_vitb14 = None
+
+try:
     import timm
 except Exception:  # pragma: no cover - import-time fallback only
     timm = None
 
 
 class ViTBackbone(nn.Module):
-    """Thin adapter around torchvision/timm Vision Transformer implementations."""
+    """Thin adapter around torchvision/timm Vision Transformer implementations.
+
+    Set ``pretrained="dinov2"`` to load a DINOv2 ViT-B/14 backbone from torchvision
+    (or timm as fallback).  When using DINOv2 the effective patch size is 14 and the
+    image size must be 224.
+    """
 
     def __init__(
         self,
@@ -38,17 +49,28 @@ class ViTBackbone(nn.Module):
         num_heads: int = 12,
         dropout: float = 0.0,
         batch_first: bool = True,
+        pretrained: Optional[str] = None,
     ) -> None:
         super().__init__()
         del batch_first
 
-        if image_size % patch_size != 0:
-            raise ValueError("image_size must be divisible by patch_size")
-
+        self.pretrained = pretrained
         self.image_size = image_size
         self.patch_size = patch_size
         self.hidden_dim = hidden_dim
         self.num_patches = (image_size // patch_size) * (image_size // patch_size)
+
+        if pretrained == "dinov2":
+            if image_size != 224 or in_channels != 3:
+                raise ValueError(f"DINOv2 requires image_size=224, in_channels=3; got {image_size}, {in_channels}")
+            self.patch_size = 14
+            self.hidden_dim = 768
+            self.image_size = 224
+            self.num_patches = (224 // 14) * (224 // 14)
+
+        if self.image_size % self.patch_size != 0:
+            raise ValueError("image_size must be divisible by patch_size")
+
         self.backend = self._select_backend(
             image_size=image_size,
             patch_size=patch_size,
@@ -72,6 +94,9 @@ class ViTBackbone(nn.Module):
         num_heads: int,
         dropout: float,
     ) -> nn.Module:
+        if self.pretrained == "dinov2":
+            return self._build_dinov2(image_size=image_size)
+
         if self._matches_vit_b16(image_size, patch_size, in_channels, hidden_dim, mlp_dim, num_layers, num_heads):
             if vit_b_16 is None:
                 if timm is None:
@@ -102,6 +127,29 @@ class ViTBackbone(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
         )
+
+    @staticmethod
+    def _build_dinov2(*, image_size: int) -> nn.Module:
+        """Load a DINOv2 ViT-B/14 backbone (torchvision first, then timm)."""
+        if _tv_dinov2_vitb14 is not None:
+            try:
+                model = _tv_dinov2_vitb14(weights="DEFAULT")
+                model.image_size = image_size
+                return model
+            except Exception as exc:
+                warnings.warn(f"torchvision DINOv2 failed ({exc}), trying timm fallback")
+
+        if timm is None:
+            raise ImportError(
+                "DINOv2 requires torchvision >= 0.16 or timm.  Neither is available."
+            )
+        model = timm.create_model(
+            "vit_base_patch14_dinov2",
+            pretrained=True,
+            img_size=image_size,
+            num_classes=0,
+        )
+        return model
 
     @staticmethod
     def _matches_vit_b16(
@@ -155,9 +203,27 @@ class ViTBackbone(nn.Module):
         if x.dim() != 4:
             raise ValueError(f"Expected [B, 3, H, W], got shape {tuple(x.shape)}")
 
+        if self.pretrained == "dinov2":
+            return self._forward_dinov2(x, self.backend)
+
         if isinstance(self.backend, nn.Module) and hasattr(self.backend, "conv_proj"):
             return self._forward_torchvision(x, self.backend)
         return self._forward_timm(x, self.backend)
+
+    def _forward_dinov2(self, x: torch.Tensor, model: nn.Module) -> torch.Tensor:
+        # torchvision DINOv2 uses ``blocks`` + ``norm`` internally
+        if hasattr(model, "_process_input") and hasattr(model, "blocks"):
+            return self._forward_dinov2_torchvision(x, model)
+        # timm fallback
+        return self._forward_timm(x, model)
+
+    @staticmethod
+    def _forward_dinov2_torchvision(x: torch.Tensor, model: nn.Module) -> torch.Tensor:
+        x = model._process_input(x)
+        for block in model.blocks:
+            x = block(x)
+        x = model.norm(x)
+        return x[:, 1:, :]  # strip CLS token
 
     def _forward_torchvision(self, x: torch.Tensor, model: nn.Module) -> torch.Tensor:
         x = model._process_input(x)

@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from gen2act.data import PolicyDemoDataset
+from gen2act.data import PolicyDemoDataset, TotoGenPolicyDataset
 from gen2act.modeling import build_default_policy
 
 
@@ -61,18 +61,38 @@ def main() -> None:
     save_path = Path(args.save_path or _resolve_path(REPO_ROOT, str(infer_cfg["save_path"])))
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    dataset = PolicyDemoDataset(
-        hdf5_path=dataset_path,
-        human_camera=str(data_cfg["human_camera"]),
-        robot_camera=str(data_cfg["robot_camera"]),
-        human_video_len=int(data_cfg["human_video_len"]),
-        robot_history_len=int(data_cfg["robot_history_len"]),
-        image_size=int(data_cfg["image_size"]),
-        num_action_dims=int(model_cfg["num_action_dims"]),
-        action_stride=int(data_cfg["action_stride"]),
-        max_samples=None if int(data_cfg["max_samples"]) <= 0 else int(data_cfg["max_samples"]),
-        gripper_threshold=float(data_cfg["gripper_threshold"]),
-    )
+    dataset_type = str(data_cfg.get("dataset_type", "hdf5")).lower()
+    max_samples = None if int(data_cfg["max_samples"]) <= 0 else int(data_cfg["max_samples"])
+    if dataset_type == "toto_gen":
+        dataset = TotoGenPolicyDataset(
+            dataset_root=dataset_path,
+            generated_subdir=str(data_cfg.get("toto_generated_subdir", "toto-gen")),
+            robot_subdir=str(data_cfg.get("toto_robot_subdir", "toto")),
+            generated_video_name=str(data_cfg.get("toto_generated_video_name", "generated.mp4")),
+            robot_video_name=str(data_cfg.get("toto_robot_video_name", "image.mp4")),
+            metadata_name=str(data_cfg.get("toto_metadata_name", "data.json")),
+            human_video_len=int(data_cfg["human_video_len"]),
+            robot_history_len=int(data_cfg["robot_history_len"]),
+            image_size=int(data_cfg["image_size"]),
+            num_action_dims=int(model_cfg["num_action_dims"]),
+            action_stride=int(data_cfg["action_stride"]),
+            max_samples=max_samples,
+            gripper_threshold=float(data_cfg["gripper_threshold"]),
+            terminate_threshold=float(data_cfg.get("terminate_threshold", 0.5)),
+        )
+    else:
+        dataset = PolicyDemoDataset(
+            hdf5_path=dataset_path,
+            human_camera=str(data_cfg["human_camera"]),
+            robot_camera=str(data_cfg["robot_camera"]),
+            human_video_len=int(data_cfg["human_video_len"]),
+            robot_history_len=int(data_cfg["robot_history_len"]),
+            image_size=int(data_cfg["image_size"]),
+            num_action_dims=int(model_cfg["num_action_dims"]),
+            action_stride=int(data_cfg["action_stride"]),
+            max_samples=max_samples,
+            gripper_threshold=float(data_cfg["gripper_threshold"]),
+        )
 
     if args.demo_index is None:
         sample = dataset[int(infer_cfg["demo_index"])]
