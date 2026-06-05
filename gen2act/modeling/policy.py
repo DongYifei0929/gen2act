@@ -48,6 +48,61 @@ class ActionHead(nn.Module):
         return action_logits, terminate_logits, gripper_logits
 
 
+class PolicyQueryDecoder(nn.Module):
+    """Read a compact policy state from robot latents conditioned on generated-video latents."""
+
+    def __init__(self, dim: int, heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.action_query = nn.Parameter(torch.randn(1, 1, dim) / dim**0.5)
+        self.robot_norm = nn.LayerNorm(dim)
+        self.human_norm = nn.LayerNorm(dim)
+        self.query_norm = nn.LayerNorm(dim)
+        self.robot_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.human_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ff = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, 4 * dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * dim, dim),
+        )
+
+    def forward(self, robot_tokens: torch.Tensor, human_tokens: torch.Tensor) -> torch.Tensor:
+        if robot_tokens.dim() != 3:
+            raise ValueError(f"Expected robot tokens as [B, N, D], got {tuple(robot_tokens.shape)}")
+        if human_tokens.dim() != 3:
+            raise ValueError(f"Expected human tokens as [B, N, D], got {tuple(human_tokens.shape)}")
+
+        batch_size = robot_tokens.shape[0]
+        query = self.action_query.expand(batch_size, -1, -1)
+        robot_ctx, _ = self.robot_attn(
+            query=self.query_norm(query),
+            key=self.robot_norm(robot_tokens),
+            value=robot_tokens,
+            need_weights=False,
+        )
+        query = query + robot_ctx
+        human_ctx, _ = self.human_attn(
+            query=self.query_norm(query),
+            key=self.human_norm(human_tokens),
+            value=human_tokens,
+            need_weights=False,
+        )
+        query = query + human_ctx
+        query = query + self.ff(query)
+        return query.squeeze(1)
+
+
 class CrossAttentionFusion(nn.Module):
     """Cross-attend robot history queries to human video keys and values."""
 
@@ -95,11 +150,14 @@ class Gen2ActPolicy(nn.Module):
         human_resampler: nn.Module,
         robot_resampler: nn.Module,
         fusion_encoder: nn.Module,
+        policy_decoder: nn.Module,
         action_head: nn.Module,
         track_predictor: nn.Module,
         num_action_dims: int,
         num_bins: int = 256,
         image_size: int = 224,
+        human_video_len: int = 16,
+        robot_history_len: int = 8,
         point_tracker: nn.Module | None = None,
         enable_point_tracking: bool = False,
         track_grid_size: int = 10,
@@ -111,25 +169,39 @@ class Gen2ActPolicy(nn.Module):
         self.human_resampler = human_resampler
         self.robot_resampler = robot_resampler
         self.fusion = fusion_encoder
+        self.policy_decoder = policy_decoder
         self.action_head = action_head
         self.track_predictor = track_predictor
         self.num_action_dims = num_action_dims
         self.num_bins = num_bins
         self.image_size = image_size
+        self.human_time_embed = nn.Parameter(torch.randn(human_video_len, 1, self.vit.hidden_dim) / self.vit.hidden_dim**0.5)
+        self.robot_time_embed = nn.Parameter(torch.randn(robot_history_len, 1, self.vit.hidden_dim) / self.vit.hidden_dim**0.5)
+        self.human_stream_embed = nn.Parameter(torch.randn(1, 1, self.vit.hidden_dim) / self.vit.hidden_dim**0.5)
+        self.robot_stream_embed = nn.Parameter(torch.randn(1, 1, self.vit.hidden_dim) / self.vit.hidden_dim**0.5)
         self.point_tracker = point_tracker
         self.enable_point_tracking = enable_point_tracking
         self.track_grid_size = track_grid_size
         self.track_query_frame = track_query_frame
         self.track_backward = track_backward
 
-    def encode_video(self, frames: torch.Tensor, resampler: nn.Module) -> torch.Tensor:
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("image_mean", mean, persistent=False)
+        self.register_buffer("image_std", std, persistent=False)
+
+    def encode_video(self, frames: torch.Tensor, resampler: nn.Module, time_embed: torch.Tensor, stream_embed: torch.Tensor) -> torch.Tensor:
         if frames.dim() != 5:
             raise ValueError(f"Expected [B, T, C, H, W], got {tuple(frames.shape)}")
 
         batch_size, time_steps, channels, height, width = frames.shape
         x = frames.reshape(batch_size * time_steps, channels, height, width)
+        x = (x - self.image_mean) / self.image_std
         patch_tokens = self.vit(x)  # [B*T, P, D]
         patch_tokens = patch_tokens.view(batch_size, time_steps, patch_tokens.shape[1], patch_tokens.shape[2])
+        if time_steps > time_embed.shape[0]:
+            raise ValueError(f"time_steps={time_steps} exceeds configured temporal embeddings={time_embed.shape[0]}")
+        patch_tokens = patch_tokens + time_embed[:time_steps].unsqueeze(0) + stream_embed.view(1, 1, 1, -1)
         return resampler(patch_tokens)
 
     def forward(
@@ -153,15 +225,25 @@ class Gen2ActPolicy(nn.Module):
                 first_bad = bad[0].tolist() if bad.numel() > 0 else None
                 print(f"[nan] {name} non-finite shape={tuple(tensor.shape)} first_bad={first_bad}")
 
-        human_tokens = self.encode_video(human_video, self.human_resampler)   # [B, Kh, D]
-        robot_tokens = self.encode_video(robot_history, self.robot_resampler)  # [B, Kr, D]
+        human_tokens = self.encode_video(
+            human_video,
+            self.human_resampler,
+            self.human_time_embed,
+            self.human_stream_embed,
+        )   # [B, Kh, D]
+        robot_tokens = self.encode_video(
+            robot_history,
+            self.robot_resampler,
+            self.robot_time_embed,
+            self.robot_stream_embed,
+        )  # [B, Kr, D]
 
         if debug_isfinite:
             _check_finite("human_tokens", human_tokens)
             _check_finite("robot_tokens", robot_tokens)
 
         robot_tokens = self.fusion(robot_tokens, human_tokens)  # [B, Kr, D]
-        ctx = robot_tokens.mean(dim=1)  # [B, D]
+        ctx = self.policy_decoder(robot_tokens, human_tokens)  # [B, D]
 
         if debug_isfinite:
             _check_finite("fusion_tokens", robot_tokens)
@@ -233,6 +315,8 @@ def build_default_policy(
     num_vit_layers: int = 12,
     num_vit_heads: int = 12,
     latent_tokens: int = 16,
+    human_video_len: int = 16,
+    robot_history_len: int = 8,
     vit_pretrained: str | None = None,
     enable_point_tracking: bool = False,
     point_tracker_checkpoint: str | None = None,
@@ -261,6 +345,7 @@ def build_default_policy(
     human_resampler = PerceiverResampler(dim=hidden_dim, num_latents=latent_tokens, num_layers=2, num_heads=8)
     robot_resampler = PerceiverResampler(dim=hidden_dim, num_latents=latent_tokens, num_layers=2, num_heads=8)
     fusion = CrossAttentionFusion(dim=hidden_dim, heads=8)
+    policy_decoder = PolicyQueryDecoder(dim=hidden_dim, heads=8)
     action_head = ActionHead(dim=hidden_dim, num_action_dims=num_action_dims, num_bins=num_bins)
     track_predictor = TrackPredictor(dim=hidden_dim, depth=6, heads=8, track_dim=2, max_steps=64)
     point_tracker = None
@@ -278,11 +363,14 @@ def build_default_policy(
         human_resampler=human_resampler,
         robot_resampler=robot_resampler,
         fusion_encoder=fusion,
+        policy_decoder=policy_decoder,
         action_head=action_head,
         track_predictor=track_predictor,
         num_action_dims=num_action_dims,
         num_bins=num_bins,
         image_size=image_size,
+        human_video_len=human_video_len,
+        robot_history_len=robot_history_len,
         point_tracker=point_tracker,
         enable_point_tracking=enable_point_tracking,
         track_grid_size=track_grid_size,

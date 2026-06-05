@@ -29,6 +29,9 @@ model = build_default_policy(
     num_vit_layers=int(model_cfg["num_vit_layers"]),
     num_vit_heads=int(model_cfg["num_vit_heads"]),
     latent_tokens=int(model_cfg["latent_tokens"]),
+    human_video_len=int(data_cfg["human_video_len"]),
+    robot_history_len=int(data_cfg["robot_history_len"]),
+    vit_pretrained=model_cfg.get("pretrained"),
     enable_point_tracking=bool(track_cfg.get("enable", False)),
     point_tracker_checkpoint=None,
     point_tracker_use_hub=bool(track_cfg.get("use_hub", False)),
@@ -42,8 +45,8 @@ model = build_default_policy(
 
 mock_human_video = torch.randn(1, 16, 3, 224, 224)    # [B, T, C, H, W] 人类演示视频
 mock_robot_history = torch.randn(1, 8, 3, 224, 224)             # [B, T, joint_dim] 机器人历史状态/动作
-mock_human_tracks = torch.randn(1, 16, 100, 2)             # [B, T, 2] 提取的人类关键点轨迹
-mock_robot_tracks = torch.randn(1, 8, 100, 2)             # [B, T, 2] 机器人末端轨迹真值
+mock_human_tracks = torch.randn(1, 100, 16, 2)             # [B, N, T, 2] 提取的人类关键点轨迹
+mock_robot_tracks = torch.randn(1, 100, 8, 2)             # [B, N, T, 2] 机器人末端轨迹真值
 
 input_data = (
     None,               # scene_img

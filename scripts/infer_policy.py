@@ -34,8 +34,43 @@ def load_config(config_path: Path):
         return tomllib.load(file_handle)
 
 
-def bin_to_value(bin_index: torch.Tensor, num_bins: int, low: float = -1.0, high: float = 1.0) -> torch.Tensor:
-    scale = max(high - low, 1e-6)
+def _action_bounds_from_config(data_cfg: dict, num_action_dims: int) -> tuple[torch.Tensor, torch.Tensor]:
+    raw_bounds = data_cfg.get("action_bounds")
+    if raw_bounds is None:
+        low = torch.full((num_action_dims,), -1.0)
+        high = torch.full((num_action_dims,), 1.0)
+        return low, high
+
+    if len(raw_bounds) != num_action_dims:
+        raise ValueError(f"action_bounds length {len(raw_bounds)} != num_action_dims {num_action_dims}")
+
+    low_values = []
+    high_values = []
+    for dim, bound in enumerate(raw_bounds):
+        if len(bound) != 2:
+            raise ValueError(f"action_bounds[{dim}] must be [low, high], got {bound}")
+        low_i = float(bound[0])
+        high_i = float(bound[1])
+        if high_i <= low_i:
+            raise ValueError(f"action_bounds[{dim}] must satisfy high > low, got {bound}")
+        low_values.append(low_i)
+        high_values.append(high_i)
+    return torch.tensor(low_values, dtype=torch.float32), torch.tensor(high_values, dtype=torch.float32)
+
+
+def bin_to_value(
+    bin_index: torch.Tensor,
+    num_bins: int,
+    low: float | torch.Tensor = -1.0,
+    high: float | torch.Tensor = 1.0,
+) -> torch.Tensor:
+    if not torch.is_tensor(low):
+        low = torch.tensor(low, dtype=torch.float32)
+    if not torch.is_tensor(high):
+        high = torch.tensor(high, dtype=torch.float32)
+    low = low.to(dtype=torch.float32, device=bin_index.device)
+    high = high.to(dtype=torch.float32, device=bin_index.device)
+    scale = (high - low).clamp(min=1e-6)
     return low + bin_index.float() * scale / max(num_bins - 1, 1)
 
 
@@ -53,7 +88,10 @@ def main() -> None:
     config = load_config(args.config)
     model_cfg = config["model"]
     data_cfg = config["data"]
+    track_cfg = config.get("track", {})
     infer_cfg = config["infer"]
+    num_action_dims = int(model_cfg["num_action_dims"])
+    action_low, action_high = _action_bounds_from_config(data_cfg, num_action_dims)
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset_path = _resolve_path(REPO_ROOT, str(args.dataset_path or data_cfg["dataset_path"]))
@@ -74,7 +112,7 @@ def main() -> None:
             human_video_len=int(data_cfg["human_video_len"]),
             robot_history_len=int(data_cfg["robot_history_len"]),
             image_size=int(data_cfg["image_size"]),
-            num_action_dims=int(model_cfg["num_action_dims"]),
+            num_action_dims=num_action_dims,
             action_stride=int(data_cfg["action_stride"]),
             max_samples=max_samples,
             gripper_threshold=float(data_cfg["gripper_threshold"]),
@@ -88,7 +126,7 @@ def main() -> None:
             human_video_len=int(data_cfg["human_video_len"]),
             robot_history_len=int(data_cfg["robot_history_len"]),
             image_size=int(data_cfg["image_size"]),
-            num_action_dims=int(model_cfg["num_action_dims"]),
+            num_action_dims=num_action_dims,
             action_stride=int(data_cfg["action_stride"]),
             max_samples=max_samples,
             gripper_threshold=float(data_cfg["gripper_threshold"]),
@@ -101,7 +139,7 @@ def main() -> None:
         sample = dataset.sample_window(demo_name, int(args.start_index or infer_cfg["start_index"]))
 
     model = build_default_policy(
-        num_action_dims=int(model_cfg["num_action_dims"]),
+        num_action_dims=num_action_dims,
         num_bins=int(model_cfg["num_bins"]),
         image_size=int(model_cfg["image_size"]),
         patch_size=int(model_cfg["patch_size"]),
@@ -109,10 +147,16 @@ def main() -> None:
         num_vit_layers=int(model_cfg["num_vit_layers"]),
         num_vit_heads=int(model_cfg["num_vit_heads"]),
         latent_tokens=int(model_cfg["latent_tokens"]),
+        human_video_len=int(data_cfg["human_video_len"]),
+        robot_history_len=int(data_cfg["robot_history_len"]),
+        vit_pretrained=model_cfg.get("pretrained"),
+        track_grid_size=int(track_cfg.get("grid_size", 10)),
+        track_query_frame=int(track_cfg.get("grid_query_frame", 0)),
+        track_backward=bool(track_cfg.get("backward_tracking", False)),
     ).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     model.eval()
 
     with torch.no_grad():
@@ -128,7 +172,7 @@ def main() -> None:
     gripper_logits = outputs["gripper_logits"][0].cpu()
 
     action_bins = action_logits.argmax(dim=-1)
-    action_values = bin_to_value(action_bins, int(model_cfg["num_bins"]))
+    action_values = bin_to_value(action_bins, int(model_cfg["num_bins"]), action_low, action_high)
 
     result = {
         "demo_name": sample["demo_name"],

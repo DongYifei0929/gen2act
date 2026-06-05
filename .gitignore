@@ -1,4 +1,6 @@
 data*/
+!gen2act/data/
+!gen2act/data/*.py
 download*/
 *video*/
 __pycache__/

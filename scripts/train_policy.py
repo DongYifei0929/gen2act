@@ -41,9 +41,52 @@ def load_config(config_path: Path) -> Dict[str, Dict[str, object]]:
         return tomllib.load(file_handle)
 
 
-def discretize_actions(actions: torch.Tensor, num_bins: int, low: float = -1.0, high: float = 1.0) -> torch.Tensor:
+def _action_bounds_from_config(
+    data_cfg: Dict[str, object],
+    num_action_dims: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raw_bounds = data_cfg.get("action_bounds")
+    if raw_bounds is None:
+        low = torch.full((num_action_dims,), -1.0, device=device)
+        high = torch.full((num_action_dims,), 1.0, device=device)
+        return low, high
+
+    if len(raw_bounds) != num_action_dims:
+        raise ValueError(f"action_bounds length {len(raw_bounds)} != num_action_dims {num_action_dims}")
+
+    low_values = []
+    high_values = []
+    for dim, bound in enumerate(raw_bounds):
+        if len(bound) != 2:
+            raise ValueError(f"action_bounds[{dim}] must be [low, high], got {bound}")
+        low_i = float(bound[0])
+        high_i = float(bound[1])
+        if high_i <= low_i:
+            raise ValueError(f"action_bounds[{dim}] must satisfy high > low, got {bound}")
+        low_values.append(low_i)
+        high_values.append(high_i)
+
+    return (
+        torch.tensor(low_values, dtype=torch.float32, device=device),
+        torch.tensor(high_values, dtype=torch.float32, device=device),
+    )
+
+
+def discretize_actions(
+    actions: torch.Tensor,
+    num_bins: int,
+    low: float | torch.Tensor = -1.0,
+    high: float | torch.Tensor = 1.0,
+) -> torch.Tensor:
     clipped = actions.clamp(low, high)
-    scale = max(high - low, 1e-6)
+    if not torch.is_tensor(low):
+        low = torch.tensor(low, dtype=actions.dtype, device=actions.device)
+    if not torch.is_tensor(high):
+        high = torch.tensor(high, dtype=actions.dtype, device=actions.device)
+    low = low.to(dtype=actions.dtype, device=actions.device)
+    high = high.to(dtype=actions.dtype, device=actions.device)
+    scale = (high - low).clamp(min=1e-6)
     normalized = (clipped - low) / scale
     bins = torch.round(normalized * (num_bins - 1)).long()
     return bins.clamp_(0, num_bins - 1)
@@ -67,7 +110,7 @@ def _tensor_l2_norm(tensors: list[torch.Tensor]) -> torch.Tensor:
         total_sq = contrib if total_sq is None else total_sq + contrib
     if total_sq is None:
         return torch.tensor(0.0)
-    return torch.sqrt(total_sq)
+    return torch.sqrt(total_sq + 1e-12)
 
 
 def _module_stats(module: torch.nn.Module) -> Dict[str, float | bool]:
@@ -90,6 +133,7 @@ def _monitored_modules(model) -> Dict[str, torch.nn.Module]:
         "human_resampler": model.human_resampler,
         "robot_resampler": model.robot_resampler,
         "fusion": model.fusion,
+        "policy_decoder": model.policy_decoder,
         "action_head": model.action_head,
         "track_predictor": model.track_predictor,
     }
@@ -116,6 +160,8 @@ def main() -> None:
     wandb_enabled = bool(wandb_cfg.get("enabled", False))
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    num_action_dims = int(model_cfg["num_action_dims"])
+    action_low, action_high = _action_bounds_from_config(data_cfg, num_action_dims, device)
     output_dir = Path(args.output_dir or _resolve_path(REPO_ROOT, str(train_cfg["output_dir"])))
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -144,7 +190,7 @@ def main() -> None:
                 human_video_len=int(data_cfg["human_video_len"]),
                 robot_history_len=int(data_cfg["robot_history_len"]),
                 image_size=int(data_cfg["image_size"]),
-                num_action_dims=int(model_cfg["num_action_dims"]),
+                num_action_dims=num_action_dims,
                 action_stride=int(data_cfg["action_stride"]),
                 max_samples=max_samples,
                 max_episodes=max_episodes,
@@ -161,7 +207,7 @@ def main() -> None:
                 human_video_len=int(data_cfg["human_video_len"]),
                 robot_history_len=int(data_cfg["robot_history_len"]),
                 image_size=int(data_cfg["image_size"]),
-                num_action_dims=int(model_cfg["num_action_dims"]),
+                num_action_dims=num_action_dims,
                 action_stride=int(data_cfg["action_stride"]),
                 max_samples=max_samples,
                 max_episodes=max_episodes,
@@ -178,7 +224,7 @@ def main() -> None:
             human_video_len=int(data_cfg["human_video_len"]),
             robot_history_len=int(data_cfg["robot_history_len"]),
             image_size=int(data_cfg["image_size"]),
-            num_action_dims=int(model_cfg["num_action_dims"]),
+            num_action_dims=num_action_dims,
             action_stride=int(data_cfg["action_stride"]),
             max_samples=max_samples,
             max_episodes=max_episodes,
@@ -193,7 +239,7 @@ def main() -> None:
             human_video_len=int(data_cfg["human_video_len"]),
             robot_history_len=int(data_cfg["robot_history_len"]),
             image_size=int(data_cfg["image_size"]),
-            num_action_dims=int(model_cfg["num_action_dims"]),
+            num_action_dims=num_action_dims,
             action_stride=int(data_cfg["action_stride"]),
             max_samples=max_samples,
             max_episodes=max_episodes,
@@ -225,7 +271,7 @@ def main() -> None:
     track_checkpoint = track_cfg.get("checkpoint") or None
 
     model = build_default_policy(
-        num_action_dims=int(model_cfg["num_action_dims"]),
+        num_action_dims=num_action_dims,
         num_bins=int(model_cfg["num_bins"]),
         image_size=int(model_cfg["image_size"]),
         patch_size=int(model_cfg["patch_size"]),
@@ -233,6 +279,8 @@ def main() -> None:
         num_vit_layers=int(model_cfg["num_vit_layers"]),
         num_vit_heads=int(model_cfg["num_vit_heads"]),
         latent_tokens=int(model_cfg["latent_tokens"]),
+        human_video_len=int(data_cfg["human_video_len"]),
+        robot_history_len=int(data_cfg["robot_history_len"]),
         vit_pretrained=model_cfg.get("pretrained"),
         enable_point_tracking=bool(track_cfg.get("enable", False)),
         point_tracker_checkpoint=track_checkpoint,
@@ -301,7 +349,7 @@ def main() -> None:
         model.train(train)
         total_loss = 0.0
         total_action = 0.0
-        # total_terminate = 0.0
+        total_terminate = 0.0
         total_gripper = 0.0
         total_track = 0.0
         steps = 0
@@ -316,7 +364,9 @@ def main() -> None:
             human_video = batch["human_video"].to(device)
             robot_history = batch["robot_history"].to(device)
             action_target = batch["action_target"].to(device)
-            # terminate_target = batch["terminate_target"].to(device)
+            terminate_target = batch.get("terminate_target")
+            if terminate_target is not None:
+                terminate_target = terminate_target.to(device)
             gripper_target = batch["gripper_target"].to(device)
             human_tracks = batch.get("human_tracks")
             robot_tracks = batch.get("robot_tracks")
@@ -336,7 +386,7 @@ def main() -> None:
             if not torch.isfinite(action_target).all():
                 print("bad action_target", batch["demo_name"], batch["start_index"])
 
-            action_bins = discretize_actions(action_target, int(model_cfg["num_bins"]))
+            action_bins = discretize_actions(action_target, int(model_cfg["num_bins"]), action_low, action_high)
 
             with torch.set_grad_enabled(train):
                 outputs = model(
@@ -350,14 +400,18 @@ def main() -> None:
                 )
 
                 action_logits = outputs["action_logits"]
-                # terminate_logits = outputs["terminate_logits"]
+                terminate_logits = outputs["terminate_logits"]
                 gripper_logits = outputs["gripper_logits"]
 
                 action_loss = F.cross_entropy(
                     action_logits.reshape(-1, action_logits.shape[-1]),
                     action_bins.reshape(-1),
                 )
-                # terminate_loss = F.cross_entropy(terminate_logits, terminate_target)
+                terminate_loss = (
+                    F.cross_entropy(terminate_logits, terminate_target)
+                    if terminate_target is not None
+                    else torch.tensor(0.0, device=device)
+                )
                 gripper_loss = F.cross_entropy(gripper_logits, gripper_target)
 
                 track_loss = torch.tensor(0.0, device=device)
@@ -396,16 +450,16 @@ def main() -> None:
                 if gradnorm_enabled and gradnorm_weights is not None:
                     weights = F.softplus(gradnorm_weights) * base_weights
                     weighted_losses = [w * loss_i for w, loss_i in zip(weights, task_losses)]
-                    loss = sum(weighted_losses)
+                    loss = sum(weighted_losses) + terminate_loss
                 else:
-                    loss = action_loss + gripper_loss + track_weight * track_loss
+                    loss = action_loss + terminate_loss + gripper_loss + track_weight * track_loss
 
                 if train:
                     optimizer.zero_grad(set_to_none=True)
                     if gradnorm_enabled and gradnorm_weights is not None:
                         loss.backward(retain_graph=True)
 
-                        shared_params = list(model.fusion.parameters())
+                        shared_params = list(model.fusion.parameters()) + list(model.policy_decoder.parameters())
                         grad_norms = []
                         for weighted_loss in weighted_losses:
                             grads = torch.autograd.grad(
@@ -458,7 +512,7 @@ def main() -> None:
 
             total_loss += float(loss.item())
             total_action += float(action_loss.item())
-            # total_terminate += float(terminate_loss.item())
+            total_terminate += float(terminate_loss.item())
             total_gripper += float(gripper_loss.item())
             total_track += float(track_loss.item())
             steps += 1
@@ -476,6 +530,7 @@ def main() -> None:
                         {
                             "train/loss": total_loss / steps,
                             "train/action": total_action / steps,
+                            "train/terminate": total_terminate / steps,
                             "train/gripper": total_gripper / steps,
                             "train/track": total_track / steps,
                             "train/lr": lr,
@@ -490,6 +545,7 @@ def main() -> None:
                 print(
                     f"[train] epoch={epoch} step={steps}/{total_steps} "
                     f"loss={total_loss / steps:.4f} action={total_action / steps:.4f} "
+                    f"terminate={total_terminate / steps:.4f} "
                     f"gripper={total_gripper / steps:.4f} track={total_track / steps:.4f} "
                     f"lr={lr:.3e} {steps_per_sec:.2f} steps/s"
                 )
@@ -498,7 +554,7 @@ def main() -> None:
         return {
             "loss": total_loss / denom,
             "action_loss": total_action / denom,
-            # "terminate_loss": total_terminate / denom,
+            "terminate_loss": total_terminate / denom,
             "gripper_loss": total_gripper / denom,
             "track_loss": total_track / denom,
         }
@@ -535,10 +591,12 @@ def main() -> None:
                     "epoch": epoch,
                     "train/epoch_loss": train_metrics["loss"],
                     "train/epoch_action": train_metrics["action_loss"],
+                    "train/epoch_terminate": train_metrics["terminate_loss"],
                     "train/epoch_gripper": train_metrics["gripper_loss"],
                     "train/epoch_track": train_metrics["track_loss"],
                     "val/epoch_loss": val_metrics["loss"],
                     "val/epoch_action": val_metrics["action_loss"],
+                    "val/epoch_terminate": val_metrics["terminate_loss"],
                     "val/epoch_gripper": val_metrics["gripper_loss"],
                     "val/epoch_track": val_metrics["track_loss"],
                 },

@@ -1,5 +1,5 @@
 [model]
-num_action_dims = 7
+num_action_dims = 6
 num_bins = 256
 image_size = 224
 patch_size = 14
@@ -21,6 +21,16 @@ max_episodes = 10
 gripper_threshold = 0.5
 terminate_threshold = 0.5
 
+# world_vector(3) + rotation_delta(3), using dataset min/max statistics.
+action_bounds = [
+  [0.1672, 0.6552],
+  [-0.3326, 0.3551],
+  [0.2106, 0.7985],
+  [-2.323, 0.749],
+  [-0.863, 1.266],
+  [-1.929, 0.872],
+]
+
 # Optional overrides for Toto-Gen layout
 # toto_generated_subdir = "toto-gen"
 # toto_robot_subdir = "toto"
@@ -29,7 +39,7 @@ terminate_threshold = 0.5
 # toto_metadata_name = "data.json"
 
 [train]
-batch_size = 1
+batch_size = 2
 epochs = 5
 lr = 0.001
 weight_decay = 0.0001
@@ -42,7 +52,7 @@ output_dir = "outputs/gen2act_policy_toto_gen"
 debug_isfinite = true
 debug_norms = true
 debug_norm_every = 10  
-gradnorm = true
+gradnorm = false
 gradnorm_alpha = 1.5
 gradnorm_lr = 1.0e-3
 
@@ -58,7 +68,7 @@ window_len = 60
 use_v2_model = false
 
 [wandb]
-enabled = false
+enabled = true
 project = "gen2act"
 # entity = "your_wandb_entity"
 # run_name = "toto_gen_run"

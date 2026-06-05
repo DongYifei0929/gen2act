@@ -30,20 +30,20 @@ class PerceiverResampler(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.latents = nn.Parameter(torch.randn(num_latents, dim))
+        self.latents = nn.Parameter(torch.randn(num_latents, dim) / dim**0.5)
         self.in_norm = nn.LayerNorm(dim)
-        self.latent_norm = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
         self.blocks = nn.ModuleList(
             [
                 nn.ModuleDict(
                     {
-                        "sa_norm": nn.LayerNorm(dim),
+                        "cross_norm": nn.LayerNorm(dim),
+                        "cross_attn": nn.MultiheadAttention(
+                            embed_dim=dim,
+                            num_heads=num_heads,
+                            dropout=dropout,
+                            batch_first=True,
+                        ),
+                        "self_norm": nn.LayerNorm(dim),
                         "self_attn": nn.MultiheadAttention(
                             embed_dim=dim,
                             num_heads=num_heads,
@@ -62,6 +62,9 @@ class PerceiverResampler(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        self.cross_attn_gates = nn.Parameter(torch.ones(num_layers))
+        self.self_attn_gates = nn.Parameter(torch.ones(num_layers))
+        self.ff_gates = nn.Parameter(torch.ones(num_layers))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 4:
@@ -73,17 +76,17 @@ class PerceiverResampler(nn.Module):
         batch_size = x.shape[0]
         latents = self.latents.unsqueeze(0).expand(batch_size, -1, -1)  # [B, K, D]
 
-        latents, _ = self.cross_attn(
-            query=self.latent_norm(latents),
-            key=x,
-            value=x,
-            need_weights=False,
-        )
-
-        for block in self.blocks:
-            normed = block["sa_norm"](latents)
+        for index, block in enumerate(self.blocks):
+            cross_out, _ = block["cross_attn"](
+                query=block["cross_norm"](latents),
+                key=x,
+                value=x,
+                need_weights=False,
+            )
+            latents = latents + torch.tanh(self.cross_attn_gates[index]) * cross_out
+            normed = block["self_norm"](latents)
             attn_out, _ = block["self_attn"](normed, normed, normed, need_weights=False)
-            latents = latents + attn_out
-            latents = latents + block["ff"](block["ff_norm"](latents))
+            latents = latents + torch.tanh(self.self_attn_gates[index]) * attn_out
+            latents = latents + torch.tanh(self.ff_gates[index]) * block["ff"](block["ff_norm"](latents))
 
         return latents
